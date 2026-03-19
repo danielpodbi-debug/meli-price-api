@@ -5,12 +5,28 @@ const { chromium } = require("playwright");
 const app = express();
 const PORT = process.env.PORT || 3000;
 
+const CACHE_TTL_MS = 10 * 60 * 1000; // 10 minutos
+const responseCache = new Map();
+
+let browserPromise = null;
+
+function getBrowser() {
+  if (!browserPromise) {
+    browserPromise = chromium.launch({
+      headless: true
+    });
+  }
+  return browserPromise;
+}
+
 app.get("/", (req, res) => {
   res.json({ ok: true, service: "meli-price-api" });
 });
 
 app.get("/meli-price", async (req, res) => {
-  let browser;
+  let context = null;
+  let page = null;
+  let stage = "init";
 
   try {
     const rawUrl = String(req.query.url || "").trim();
@@ -22,7 +38,16 @@ app.get("/meli-price", async (req, res) => {
       });
     }
 
+    stage = "parse_url";
     const urlObj = new URL(rawUrl);
+
+    if (!/mercadolibre\./i.test(urlObj.hostname)) {
+      return res.status(400).json({
+        ok: false,
+        error: "Dominio no permitido"
+      });
+    }
+
     const offerType = urlObj.searchParams.get("offer_type") || null;
     const idInfo = extraerId(rawUrl);
 
@@ -33,23 +58,43 @@ app.get("/meli-price", async (req, res) => {
       });
     }
 
-    browser = await chromium.launch({
-      headless: true
-    });
+    const cacheKey = `${rawUrl}|${offerType || ""}`;
+    const cached = responseCache.get(cacheKey);
 
-    const page = await browser.newPage({
+    if (cached && (Date.now() - cached.timestamp < CACHE_TTL_MS)) {
+      return res.json({
+        ...cached.data,
+        debug: {
+          ...cached.data.debug,
+          cache_hit: true
+        }
+      });
+    }
+
+    stage = "get_browser";
+    const browser = await getBrowser();
+
+    stage = "new_context";
+    context = await browser.newContext({
       locale: "es-MX",
       userAgent:
         "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36"
     });
 
+    page = await context.newPage();
+
+    stage = "goto";
     await page.goto(rawUrl, {
       waitUntil: "domcontentloaded",
-      timeout: 60000
+      timeout: 45000
     });
 
-    await page.waitForTimeout(5000);
+    stage = "wait_selectors";
+    await page.waitForSelector("#price, .ui-pdp-price__main-container, h1", {
+      timeout: 8000
+    }).catch(() => {});
 
+    stage = "evaluate";
     const result = await page.evaluate((offerType) => {
       function normalize(text) {
         return String(text || "").replace(/\s+/g, " ").trim();
@@ -82,7 +127,6 @@ app.get("/meli-price", async (req, res) => {
       function collectOffersBlocks() {
         const blocks = [];
         const seen = new Set();
-
         const allDivs = Array.from(document.querySelectorAll("div"));
 
         for (const div of allDivs) {
@@ -90,9 +134,8 @@ app.get("/meli-price", async (req, res) => {
           const lower = text.toLowerCase();
 
           const looksLikeOffer =
-            text.includes("Comprar ahora") &&
             text.includes("$") &&
-            (lower.includes("llega") || lower.includes("retiro gratis"));
+            (lower.includes("comprar ahora") || lower.includes("agregar al carrito"));
 
           if (!looksLikeOffer) continue;
 
@@ -107,16 +150,12 @@ app.get("/meli-price", async (req, res) => {
             const isPrevious =
               cls.includes("andes-money-amount--previous") || !!money.closest("s");
 
-            parsed.push({
-              price,
-              isPrevious
-            });
+            parsed.push({ price, isPrevious });
           }
 
           const currentPrices = parsed
             .filter(p => !p.isPrevious)
-            .map(p => p.price)
-            .filter(p => p >= 100);
+            .map(p => p.price);
 
           const previousPrices = parsed
             .filter(p => p.isPrevious)
@@ -125,20 +164,15 @@ app.get("/meli-price", async (req, res) => {
           if (!currentPrices.length) continue;
 
           const block = {
-            current_price: Math.max(...currentPrices),
+            current_price: Math.min(...currentPrices),
             previous_price: previousPrices.length ? Math.max(...previousPrices) : null,
             row_text: text,
-            has_today:
-              lower.includes("llega hoy") ||
-              lower.includes("llega gratis hoy"),
-            has_tomorrow:
-              lower.includes("llega mañana") ||
-              lower.includes("a partir de mañana"),
-            has_delivery:
-              lower.includes("llega") || lower.includes("retiro gratis")
+            has_today: lower.includes("llega hoy") || lower.includes("llega gratis hoy"),
+            has_tomorrow: lower.includes("llega mañana") || lower.includes("a partir de mañana"),
+            has_delivery: lower.includes("llega") || lower.includes("retiro gratis")
           };
 
-          const key = `${block.current_price}|${block.previous_price}|${block.row_text.slice(0, 200)}`;
+          const key = `${block.current_price}|${block.previous_price}|${block.row_text.slice(0, 180)}`;
           if (seen.has(key)) continue;
           seen.add(key);
 
@@ -166,23 +200,14 @@ app.get("/meli-price", async (req, res) => {
           const isPrevious =
             cls.includes("andes-money-amount--previous") || !!money.closest("s");
 
-          parsed.push({
-            price,
-            isPrevious
-          });
+          parsed.push({ price, isPrevious });
         }
 
-        const currentPrices = parsed
-          .filter(p => !p.isPrevious)
-          .map(p => p.price)
-          .filter(p => p >= 100);
-
-        const previousPrices = parsed
-          .filter(p => p.isPrevious)
-          .map(p => p.price);
+        const currentPrices = parsed.filter(p => !p.isPrevious).map(p => p.price);
+        const previousPrices = parsed.filter(p => p.isPrevious).map(p => p.price);
 
         return {
-          current_price: currentPrices.length ? Math.max(...currentPrices) : null,
+          current_price: currentPrices.length ? Math.min(...currentPrices) : null,
           previous_price: previousPrices.length ? Math.max(...previousPrices) : null,
           row_text: normalize(root.textContent)
         };
@@ -243,10 +268,7 @@ app.get("/meli-price", async (req, res) => {
       };
     }, offerType);
 
-    await browser.close();
-    browser = null;
-
-    return res.json({
+    const payload = {
       ok: true,
       source_type: "catalog_offer_resolution",
       product_or_item_id: idInfo.id,
@@ -260,37 +282,54 @@ app.get("/meli-price", async (req, res) => {
         chosen_source: result.chosen ? result.chosen.source : null,
         chosen_row_text: result.chosen ? result.chosen.row_text : null,
         offer_rows_found: result.offerRows ? result.offerRows.length : 0,
-        main_offer_price: result.mainOffer ? result.mainOffer.current_price : null
+        main_offer_price: result.mainOffer ? result.mainOffer.current_price : null,
+        cache_hit: false
       }
+    };
+
+    responseCache.set(cacheKey, {
+      timestamp: Date.now(),
+      data: payload
     });
+
+    return res.json(payload);
   } catch (error) {
-    if (browser) {
-      try {
-        await browser.close();
-      } catch (_) {}
-    }
+    console.error("Error en /meli-price:", error);
 
     return res.status(500).json({
       ok: false,
-      error: error.message
+      error: error.message,
+      stage
     });
+  } finally {
+    if (page) {
+      try {
+        await page.close();
+      } catch (_) {}
+    }
+
+    if (context) {
+      try {
+        await context.close();
+      } catch (_) {}
+    }
   }
 });
 
 function extraerId(url) {
-  const itemMatch = url.match(/(ML[A-Z])-(\d+)/i);
+  const itemMatch = url.match(/\b(ML[A-Z]-\d+)\b/i);
   if (itemMatch) {
     return {
       type: "item",
-      id: `${itemMatch[1].toUpperCase()}${itemMatch[2]}`
+      id: itemMatch[1].replace("-", "").toUpperCase()
     };
   }
 
-  const productMatch = url.match(/ML[A-Z]\d+/i);
+  const productMatch = url.match(/\b(ML[A-Z]\d+)\b/i);
   if (productMatch) {
     return {
       type: "product",
-      id: productMatch[0].toUpperCase()
+      id: productMatch[1].toUpperCase()
     };
   }
 
