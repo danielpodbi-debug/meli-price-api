@@ -389,7 +389,15 @@ app.get("/meli-price", async (req, res) => {
 });
 
 function extraerId(url) {
-  const itemMatch = url.match(/\b(ML[A-Z]-\d+)\b/i);
+  const raw = String(url || "").trim();
+  if (!raw) return null;
+
+  let pathname = "";
+  try {
+    pathname = new URL(raw).pathname || "";
+  } catch (_) {}
+
+  const itemMatch = raw.match(/\b(ML[A-Z]-\d+)\b/i);
   if (itemMatch) {
     return {
       type: "item",
@@ -397,7 +405,18 @@ function extraerId(url) {
     };
   }
 
-  const productMatch = url.match(/\b(ML[A-Z]\d+)\b/i);
+  const userProductMatch =
+    raw.match(/\b(ML[A-Z]U\d+)\b/i) ||
+    pathname.match(/\/up\/(ML[A-Z]U\d+)(?:\/|$)/i);
+
+  if (userProductMatch) {
+    return {
+      type: "user_product",
+      id: userProductMatch[1].toUpperCase()
+    };
+  }
+
+  const productMatch = raw.match(/\b(ML[A-Z]\d+)\b/i);
   if (productMatch) {
     return {
       type: "product",
